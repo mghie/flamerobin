@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.18)
 option(ENABLE_VCPKG "Enable vcpkg for dependency management" ON)
 option(ENABLE_ASAN "Enable AddressSanitizer (ASan) for memory error detection" OFF)
 option(ENABLE_CRT_LEAK_CHECK "Enable CRT Debug Heap leak reporting on exit (MSVC Debug builds only)" OFF)
+option(ENABLE_CRASHPAD "Enable Crashpad for crash data collection (MSVC builds only)" OFF)
 set(VCPKG_ROOT "${CMAKE_SOURCE_DIR}/vcpkg")
 if(ENABLE_VCPKG AND EXISTS "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
     set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
@@ -784,7 +785,7 @@ endif ()
 if (ENABLE_VCPKG)
     find_package(Boost REQUIRED COMPONENTS filesystem)
     list(APPEND FR_LIBS Boost::filesystem)
-    if (WIN32)
+    if (WIN32 AND ENABLE_CRASHPAD)
         find_package(crashpad CONFIG REQUIRED)
         list(APPEND FR_LIBS crashpad::crashpad)
     endif ()
@@ -796,28 +797,30 @@ target_link_libraries(${PROJECT_NAME} fb-cpp::fb-cpp ${wxWidgets_LIBRARIES} ${FR
 target_compile_definitions(${PROJECT_NAME} PRIVATE FBCPP_VERSION="${FBCPP_VERSION_STR}")
 
 if (ENABLE_VCPKG AND WIN32)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE FR_USE_CRASHPAD)
     if (NOT VCPKG_TARGET_TRIPLET)
         set(VCPKG_TARGET_TRIPLET "x64-windows")
     endif()
-    find_program(CRASHPAD_HANDLER_EXE
-        NAMES crashpad_handler
-        PATHS
-            "${CMAKE_SOURCE_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools/crashpad"
-            "${CMAKE_SOURCE_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools"
-            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools/crashpad"
-            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools"
-        NO_DEFAULT_PATH
-    )
-    if (CRASHPAD_HANDLER_EXE)
-        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CRASHPAD_HANDLER_EXE}"
-            $<TARGET_FILE_DIR:${PROJECT_NAME}>
-        )
-    else()
-        message(WARNING "crashpad_handler.exe not found! Dumps might not be writeable.")
-    endif()
+	if (ENABLE_CRASHPAD)
+		target_compile_definitions(${PROJECT_NAME} PRIVATE FR_USE_CRASHPAD)
+		find_program(CRASHPAD_HANDLER_EXE
+			NAMES crashpad_handler
+			PATHS
+				"${CMAKE_SOURCE_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools/crashpad"
+				"${CMAKE_SOURCE_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools"
+				"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools/crashpad"
+				"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools"
+			NO_DEFAULT_PATH
+		)
+		if (CRASHPAD_HANDLER_EXE)
+			add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${CRASHPAD_HANDLER_EXE}"
+				$<TARGET_FILE_DIR:${PROJECT_NAME}>
+			)
+		else()
+			message(WARNING "crashpad_handler.exe not found! Dumps might not be writeable.")
+		endif()
+	endif()
 endif()
 
 enable_testing()
