@@ -223,6 +223,7 @@ void MainFrame::buildMainMenu()
 
     databaseMenuM = new wxMenu();
     databaseMenuM->Append(Cmds::Menu_NewVolatileSQLEditor, _("Open new Volatile &SQL Editor..."));
+    databaseMenuM->AppendSeparator();
     databaseMenuM->Append(Cmds::Menu_RegisterDatabase, _("R&egister existing database..."));
     databaseMenuM->Append(Cmds::Menu_CreateDatabase, _("Create &new database..."));
     databaseMenuM->Append(Cmds::Menu_RestoreIntoNew, _("Restore bac&kup into new database..."));
@@ -231,10 +232,6 @@ void MainFrame::buildMainMenu()
     databaseMenuM->AppendSeparator();
     // the items above stay, OnMainMenuOpen() rebuilds the ones below
     databaseMenuFixedItemsM = databaseMenuM->GetMenuItemCount();
-    databaseMenuM->Append(Cmds::Menu_CompareSchemas, _("Compare database &schemas..."));
-    databaseMenuM->Append(Cmds::Menu_SessionMonitor, _("Live Session & Transaction Monitor..."));
-    databaseMenuM->Append(Cmds::Menu_DatabaseMaintenanceDashboard, _("Maintenance & Health Dashboard..."));
-    databaseMenuM->AppendSeparator();
     menuBarM->Append(databaseMenuM, _("&Database"));
 
 #ifdef __WXMAC__
