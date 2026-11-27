@@ -119,12 +119,10 @@ private:
     void log(wxString s, TextType type = ttNormal);     // write messages to textbox
     void clearLogBeforeExecution();
     void flushLogView();    // repaint log + plan views before a blocking call (#747)
-    void prepareVolatileDatabase(wxString server = "", wxString port = "3050", wxString db = "", wxString user = "", wxString password = "", wxString role = "", wxString charset = "NONE");
 
     void splitScreen();
     Database* databaseM;
     DatabasePtr databasePtrM;
-    ServerPtr serverPtrM;
 
     StatementHistory::Position historyPositionM;
     wxString localBuffer;
@@ -184,11 +182,13 @@ private:
     bool profilerCheckedM;
     bool profilerAvailableM;
 
-    // blob-editor-timer
+    // blob-editor and filter-debounce timers
     enum {
-        TIMER_ID_UPDATE_BLOB = 1
+        TIMER_ID_UPDATE_BLOB = 1,
+        TIMER_ID_FILTER_DEBOUNCE = 2
     };
     wxTimer timerBlobEditorM;
+    wxTimer timerFilterDebounceM;
     // blob-editor dialog
     EditBlobDialog* editBlobDlgM;
     // blob-editor event
@@ -304,7 +304,10 @@ private:
     void OnMenuFindSelectedObject(wxCommandEvent& event);
 
     void OnFilterTextChange(wxCommandEvent& event);
+    void OnFilterTextEnter(wxCommandEvent& event);
+    void OnFilterDebounceTimer(wxTimerEvent& event);
     void OnFilterClearClick(wxCommandEvent& event);
+    void triggerGridFilterNow();
     void updateFilterCountLabel();
 
     void set_properties();

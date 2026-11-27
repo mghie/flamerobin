@@ -574,12 +574,9 @@ ExecuteSqlFrame::ExecuteSqlFrame(wxWindow* WXUNUSED(parent), int id,
         wxString title,
         DatabasePtr db, const wxPoint& pos, const wxSize& size, long style)
     : BaseFrame(wxTheApp->GetTopWindow(), id, title, pos, size, style),
-        Observer(), databasePtrM(db) //changed for volatile SQL Editor, as we only have a fake server and database
+        Observer(), databaseM(db.get()), databasePtrM(db)
 {
     wxASSERT(db);
-    //Need this 2 PtrM lines especifically to keep a reference for both original objects in volatile SQL Editor else the serverptr is released as soon as exists MainFrame event call
-    databaseM = databasePtrM.get();
-    serverPtrM = databasePtrM->getServer();
 
     loadingM = true;
     sashPositionM = 0;
@@ -587,8 +584,6 @@ ExecuteSqlFrame::ExecuteSqlFrame(wxWindow* WXUNUSED(parent), int id,
     updateFrameTitleM = true;
     profilerCheckedM = false;
     profilerAvailableM = false;
-    if (db->getIsVolative())
-        prepareVolatileDatabase();
 
     transactionIsolationLevelM = static_cast<fr::TransactionIsolationLevel>(config().get("transactionIsolationLevel", 1));
     transactionLockResolutionM = config().get("transactionLockResolution", true) ? fr::TransactionLockResolution::Wait : fr::TransactionLockResolution::NoWait;
@@ -598,6 +593,7 @@ ExecuteSqlFrame::ExecuteSqlFrame(wxWindow* WXUNUSED(parent), int id,
     highlightWordText = config().get("highlightWordText", true);
 
     timerBlobEditorM.SetOwner(this, TIMER_ID_UPDATE_BLOB);
+    timerFilterDebounceM.SetOwner(this, TIMER_ID_FILTER_DEBOUNCE);
 
     buildToolbar(CommandManager::get());
     buildMainMenu(CommandManager::get());
@@ -678,7 +674,7 @@ ExecuteSqlFrame::ExecuteSqlFrame(wxWindow* WXUNUSED(parent), int id,
     sizer_filter->Add(button_clear_filter, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
 
     label_filter_count = new wxStaticText(notebook_pane_2, -1, _("0 rows"));
-    sizer_filter->Add(label_filter_count, 0, wxALIGN_CENTER_VERTICAL);
+    sizer_filter->Add(label_filter_count, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 2);
 
     sizer_data_pane->Add(sizer_filter, 0, wxEXPAND | wxALL, 4);
     grid_data = new DataGrid(notebook_pane_2, ID_grid_data);
@@ -729,11 +725,11 @@ ExecuteSqlFrame::ExecuteSqlFrame(wxWindow* WXUNUSED(parent), int id,
     do_layout();
 
     // observe database object to close on disconnect / destruction
-    if (!db->getIsVolative()) databaseM->attachObserver(this, false);
+    databaseM->attachObserver(this, false);
 
     executedStatementsM.clear();
     inTransaction(false);    // enable/disable controls
-    if (!db->getIsVolative()) setKeywords();           // set words for autocomplete feature
+    setKeywords();           // set words for autocomplete feature
 
     historyPositionM = StatementHistory::get(databaseM).size();
 
@@ -1016,12 +1012,9 @@ void ExecuteSqlFrame::set_properties()
     int statusbar_widths[] = { -2, 100, 60, -1 };
     statusbar_1->SetStatusWidths(4, statusbar_widths);
 
-    if ( ! databaseM->getIsVolative() )
-    {
-        statusbar_1->SetStatusText(databaseM->getConnectionInfoString(), 0);
-        DatabaseSecurityStatus sec = databaseM->getSecurityProtocolStatus();
-        statusbar_1->SetStatusText(wxString::Format("WireCrypt: %s (%s)", sec.wireEncryption.c_str(), sec.authPlugin.c_str()), 2);
-    }
+    statusbar_1->SetStatusText(databaseM->getConnectionInfoString(), 0);
+    DatabaseSecurityStatus sec = databaseM->getSecurityProtocolStatus();
+    statusbar_1->SetStatusText(wxString::Format("WireCrypt: %s (%s)", sec.wireEncryption.c_str(), sec.authPlugin.c_str()), 2);
     statusbar_1->SetStatusText("Rows fetched", 1);
     statusbar_1->SetStatusText("Transaction status", 3);
 
@@ -1141,8 +1134,12 @@ bool ExecuteSqlFrame::doCanClose()
 
 void ExecuteSqlFrame::doBeforeDestroy()
 {
+    timerFilterDebounceM.Stop();
     if (grid_data && grid_data->getDataGridTable())
+    {
+        grid_data->getDataGridTable()->stopBackgroundFilter();
         grid_data->getDataGridTable()->stopBackgroundFetch();
+    }
     if (executionWorkerM.joinable())
     {
         cancelExecutionM.store(true);
@@ -1162,11 +1159,8 @@ void ExecuteSqlFrame::doBeforeDestroy()
     if (grid_data->IsCellEditControlEnabled())
         grid_data->EnableCellEditControl(false);
     // make sure that further calls to update() will not call Close() again
-    if (databaseM && databaseM->getIsVolative() && databaseM->isConnected())
-        databaseM->disconnect();
     databaseM = 0;
-    databasePtrM = 0;
-    serverPtrM = 0;
+    databasePtrM.reset();
 }
 
 void ExecuteSqlFrame::showProperties(wxString objectName)
@@ -1321,7 +1315,7 @@ BEGIN_EVENT_TABLE(ExecuteSqlFrame, wxFrame)
         ExecuteSqlFrame::OnGridRowCountChanged)
 
     EVT_TEXT(ExecuteSqlFrame::ID_text_ctrl_filter, ExecuteSqlFrame::OnFilterTextChange)
-    EVT_TEXT_ENTER(ExecuteSqlFrame::ID_text_ctrl_filter, ExecuteSqlFrame::OnFilterTextChange)
+    EVT_TEXT_ENTER(ExecuteSqlFrame::ID_text_ctrl_filter, ExecuteSqlFrame::OnFilterTextEnter)
     EVT_BUTTON(ExecuteSqlFrame::ID_button_clear_filter, ExecuteSqlFrame::OnFilterClearClick)
     EVT_CHOICE(ExecuteSqlFrame::ID_choice_connection_switcher, ExecuteSqlFrame::OnConnectionSwitcherSelect)
 
@@ -1336,6 +1330,7 @@ BEGIN_EVENT_TABLE(ExecuteSqlFrame, wxFrame)
     EVT_GRID_CMD_LABEL_LEFT_DCLICK(ExecuteSqlFrame::ID_grid_data, ExecuteSqlFrame::OnGridLabelLeftDClick)
 
     EVT_TIMER(ExecuteSqlFrame::TIMER_ID_UPDATE_BLOB, ExecuteSqlFrame::OnBlobEditorUpdate)
+    EVT_TIMER(ExecuteSqlFrame::TIMER_ID_FILTER_DEBOUNCE, ExecuteSqlFrame::OnFilterDebounceTimer)
 END_EVENT_TABLE()
 
 // Avoiding the annoying thing that you cannot click inside the selection and have it deselected and have caret there
@@ -2972,13 +2967,53 @@ void ExecuteSqlFrame::OnMenuGridExportData(wxCommandEvent& WXUNUSED(event))
 
 void ExecuteSqlFrame::OnFilterTextChange(wxCommandEvent& WXUNUSED(event))
 {
-    if (!grid_data)
+    if (!grid_data || !text_ctrl_filter)
+        return;
+
+    wxString query = text_ctrl_filter->GetValue();
+    if (query.IsEmpty())
+    {
+        timerFilterDebounceM.Stop();
+        triggerGridFilterNow();
+        return;
+    }
+
+    int debounceMs = config().get("DataGridFilterDebounceMs", 300);
+    if (debounceMs <= 0)
+    {
+        timerFilterDebounceM.Stop();
+        triggerGridFilterNow();
+        return;
+    }
+
+    if (DataGridTable* table = grid_data->getDataGridTable())
+        table->stopBackgroundFilter();
+
+    timerFilterDebounceM.StartOnce(debounceMs);
+    updateFilterCountLabel();
+}
+
+void ExecuteSqlFrame::OnFilterTextEnter(wxCommandEvent& WXUNUSED(event))
+{
+    timerFilterDebounceM.Stop();
+    triggerGridFilterNow();
+}
+
+void ExecuteSqlFrame::OnFilterDebounceTimer(wxTimerEvent& WXUNUSED(event))
+{
+    timerFilterDebounceM.Stop();
+    triggerGridFilterNow();
+}
+
+void ExecuteSqlFrame::triggerGridFilterNow()
+{
+    if (!grid_data || !text_ctrl_filter)
         return;
     DataGridTable* table = grid_data->getDataGridTable();
     if (table)
     {
-        wxString query = text_ctrl_filter->GetValue();
-        table->filterRows(query);
+        table->startFilterRowsAsync(text_ctrl_filter->GetValue());
+        grid_data->AdjustScrollbars();
         grid_data->ForceRefresh();
         updateFilterCountLabel();
     }
@@ -2986,14 +3021,16 @@ void ExecuteSqlFrame::OnFilterTextChange(wxCommandEvent& WXUNUSED(event))
 
 void ExecuteSqlFrame::OnFilterClearClick(wxCommandEvent& WXUNUSED(event))
 {
+    timerFilterDebounceM.Stop();
     if (text_ctrl_filter)
-        text_ctrl_filter->Clear();
+        text_ctrl_filter->ChangeValue(wxEmptyString);
     if (grid_data)
     {
         DataGridTable* table = grid_data->getDataGridTable();
         if (table)
         {
             table->clearFilterAndSort();
+            grid_data->AdjustScrollbars();
             grid_data->ForceRefresh();
             updateFilterCountLabel();
         }
@@ -3005,15 +3042,20 @@ void ExecuteSqlFrame::updateFilterCountLabel()
     if (!grid_data || !label_filter_count)
         return;
     DataGridTable* table = grid_data->getDataGridTable();
-    if (table)
+    if (!table)
+        return;
+
+    if (table->isFiltering())
     {
-        int filtered = table->GetNumberRows();
-        int total = table->getTotalRowCount();
-        if (filtered == total)
-            label_filter_count->SetLabel(wxString::Format(_("Rows: %d"), total));
-        else
-            label_filter_count->SetLabel(wxString::Format(_("Filtered: %d / %d rows"), filtered, total));
+        setStaticTextAndRelayout(label_filter_count,
+            _("Filtering..."), notebook_pane_2);
+        return;
     }
+
+    int filtered = table->GetNumberRows();
+    int total = table->getTotalRowCount();
+    setStaticTextAndRelayout(label_filter_count,
+        formatFilterCountLabel(filtered, total), notebook_pane_2);
 }
 
 void ExecuteSqlFrame::populateConnectionSwitcher()
@@ -3101,12 +3143,11 @@ void ExecuteSqlFrame::OnConnectionSwitcherSelect(wxCommandEvent& WXUNUSED(event)
         }
     }
 
-    if (databaseM && !databaseM->getIsVolative())
+    if (databaseM)
         databaseM->detachObserver(this);
 
     databasePtrM = newDbPtr;
     databaseM = newDbPtr.get();
-    serverPtrM = databaseM->getServer();
 
     if (!databaseM->isConnected())
     {
@@ -3122,8 +3163,7 @@ void ExecuteSqlFrame::OnConnectionSwitcherSelect(wxCommandEvent& WXUNUSED(event)
         }
     }
 
-    if (!databaseM->getIsVolative())
-        databaseM->attachObserver(this, false);
+    databaseM->attachObserver(this, false);
 
     updateEnvironmentBanner();
     setKeywords();
@@ -3291,30 +3331,6 @@ void ExecuteSqlFrame::clearLogBeforeExecution()
 {
     if (config().get("SQLEditorExecuteClears", false))
         styled_text_ctrl_stats->ClearAll();
-}
-
-void ExecuteSqlFrame::prepareVolatileDatabase(wxString hostname, wxString port, wxString path, wxString user, wxString password, wxString role, wxString charset)
-{
-    ServerPtr serverPtrM = databaseM->getServer();
-    if (!serverPtrM->getHostname().compare(hostname) || !serverPtrM->getPort().compare(port) || !databaseM->getPath().compare(path) || !databaseM->getUsername().compare(user) || !databaseM->getRawPassword().compare(password) || !databaseM->getRole().compare(role) || !databaseM->getDatabaseCharset().compare(charset))
-    {
-        databaseM->disconnect();
-        transactionM = 0;
-    }
-    else
-        return;
-
-    serverPtrM->setHostname(hostname);
-    serverPtrM->setPort(port);
-
-    databaseM->setPath(path);
-    databaseM->setName_("VOLATILECONNECTION");
-    databaseM->setUsername(user);
-    databaseM->setRawPassword(password);
-    databaseM->setRole(role);
-    databaseM->setConnectionCharset(charset);
-    //databaseM->setServer(serverPtrM);
-
 }
 
 void ExecuteSqlFrame::prepareAndExecute(bool prepareOnly, bool fetchAll)
@@ -3829,7 +3845,10 @@ bool ExecuteSqlFrame::execute(wxString sql, const wxString& terminator,
     } closeGuard{this};
 
     if (grid_data && grid_data->getDataGridTable())
+    {
+        grid_data->getDataGridTable()->stopBackgroundFilter();
         grid_data->getDataGridTable()->stopBackgroundFetch();
+    }
 
     ScrollAtEnd sae(styled_text_ctrl_stats);
 
@@ -3858,42 +3877,15 @@ bool ExecuteSqlFrame::execute(wxString sql, const wxString& terminator,
 
     if ((stm.getAction() == actCONNECT) || (stm.getAction() == actCREATE_DATABASE))
     {
-        if (!databaseM->getIsVolative())
-        {
-            log(_("Cannot use 'connect' or 'create' statement in a regular SQL Script"), ttError);
-            splitScreen();
-            return false;
-        }
-        wxString connHostM, connDatabasePortM, connPathM, connUsernameM, connPasswordM, connRoleM, connCharsetM, connOwnerM, connInitialUserM;
-        int createPageSizeM, createDialecM;
-        stm.getCONNECTION(connHostM, connDatabasePortM, connPathM, connUsernameM, connPasswordM, connRoleM, connCharsetM);
-        prepareVolatileDatabase(connHostM, connDatabasePortM, connPathM, connUsernameM, connPasswordM, connRoleM, connCharsetM);
-        if (stm.getAction() == actCREATE_DATABASE) {
-            createPageSizeM = stm.getCreatePageSize();
-            createDialecM = stm.getCreateDialect();
-            connOwnerM = stm.getCreateOwner();
-            connInitialUserM = stm.getCreateInitialUser();
-            log(wxString::Format("Creating database: %s, port: %s, database: %s, user: %s, password: %s, role: %s, charset: %s, page size: %d, dialect %d, owner: %s, initial user: %s",
-                connHostM, connDatabasePortM, connPathM, connUsernameM, connPasswordM, connRoleM, connCharsetM, createPageSizeM, createDialecM, connOwnerM, connInitialUserM), ttSql);
-            databaseM->create(createPageSizeM, createDialecM, connOwnerM, connInitialUserM);
-        }
-        log(wxString::Format("Connecting to host: %s, port: %s, database: %s, user: %s, password: %s, role: %s, charset: %s", connHostM, connDatabasePortM, connPathM, connUsernameM, connPasswordM, connRoleM, connCharsetM), ttSql);
-        databaseM->connect(databaseM->getRawPassword());
-        return databaseM->isConnected();
-
+        log(_("Cannot use 'CONNECT' or 'CREATE DATABASE' statement in a SQL script"), ttError);
+        splitScreen();
+        return false;
     }
-    else
-    if (stm.getAction() == actDISCONNECT) 
+    else if (stm.getAction() == actDISCONNECT)
     {
-        if (!databaseM->getIsVolative())
-        {
-            log(_("Cannot use 'disconnect' statement in a regular SQL Script"), ttError);
-            splitScreen();
-            return false;
-        }
-        databaseM->disconnect();
-        transactionM = 0;
-        return true;
+        log(_("Cannot use 'DISCONNECT' statement in a SQL script"), ttError);
+        splitScreen();
+        return false;
     }
     if (styled_text_ctrl_sql->AutoCompActive())
         styled_text_ctrl_sql->AutoCompCancel();    // remove the list if needed
@@ -3903,6 +3895,23 @@ bool ExecuteSqlFrame::execute(wxString sql, const wxString& terminator,
     long waitForParameterInputTime = 0;
     try
     {
+        // Tear down any previous statement, open cursor, and row/BLOB buffers
+        // BEFORE starting a new transaction or preparing the next statement (#779).
+        timerFilterDebounceM.Stop();
+        if (text_ctrl_filter)
+            text_ctrl_filter->ChangeValue(wxEmptyString);
+        if (grid_data)
+        {
+            if (DataGridTable* prevTb = grid_data->getDataGridTable())
+                prevTb->setStatement(nullptr);
+            grid_data->ClearGrid();
+        }
+        if (statementM)
+        {
+            try { statementM->close(); } catch (...) {}
+            statementM = nullptr;
+        }
+
         if (!isTransactionStarted())
         {
             log(_("Starting transaction..."));
@@ -3957,7 +3966,6 @@ bool ExecuteSqlFrame::execute(wxString sql, const wxString& terminator,
             databaseM->getDALDatabase()->getCounts(&ins1, &upd1, &del1, &ridx1, &rseq1);
             databaseM->getDALDatabase()->getDetailedCounts(counts1);
         }
-        grid_data->ClearGrid(); // statement object will be invalidated, so clear the grid
         statementM = databaseM->getDALDatabase()->createStatement(transactionM);
         log(_("Preparing statement: ") + sql, ttSql);
         sae.scroll();
@@ -4212,7 +4220,6 @@ bool ExecuteSqlFrame::execute(wxString sql, const wxString& terminator,
         {
             if (text_ctrl_filter && !text_ctrl_filter->IsEmpty())
                 text_ctrl_filter->ChangeValue(wxEmptyString);
-            updateFilterCountLabel();
 
             DataGridTable* tb = grid_data->getDataGridTable();
             if (tb)
@@ -4224,6 +4231,7 @@ bool ExecuteSqlFrame::execute(wxString sql, const wxString& terminator,
             if (fetchAll)
                 grid_data->fetchAll();
             setViewMode(vmGrid);
+            updateFilterCountLabel();
             grid_data->AdjustScrollbars();
             grid_data->ForceRefresh();
         }
@@ -4418,7 +4426,10 @@ void ExecuteSqlFrame::OnMenuCommit(wxCommandEvent& WXUNUSED(event))
 bool ExecuteSqlFrame::commitTransaction()
 {
     if (grid_data && grid_data->getDataGridTable())
+    {
+        grid_data->getDataGridTable()->stopBackgroundFilter();
         grid_data->getDataGridTable()->stopBackgroundFetch();
+    }
     if (!isTransactionStarted())    // check
     {
         inTransaction(false);
@@ -4437,8 +4448,13 @@ bool ExecuteSqlFrame::commitTransaction()
         flushLogView();
         {
             wxStopWatch sw;
+            if (grid_data && grid_data->getDataGridTable())
+                grid_data->getDataGridTable()->setStatement(nullptr);
             if (statementM != 0)
+            {
                 statementM->close();
+                statementM = nullptr;
+            }
             transactionM->commit();
             log(wxString::Format(_("Transaction committed (elapsed time: %s)."),
                 millisToTimeString(sw.Time()).c_str()));
@@ -4512,7 +4528,10 @@ void ExecuteSqlFrame::OnMenuRollback(wxCommandEvent& WXUNUSED(event))
 bool ExecuteSqlFrame::rollbackTransaction()
 {
     if (grid_data && grid_data->getDataGridTable())
+    {
+        grid_data->getDataGridTable()->stopBackgroundFilter();
         grid_data->getDataGridTable()->stopBackgroundFetch();
+    }
     if (!isTransactionStarted())    // check
     {
         executedStatementsM.clear();
@@ -4531,8 +4550,13 @@ bool ExecuteSqlFrame::rollbackTransaction()
         flushLogView();
         {
             wxStopWatch sw;
+            if (grid_data && grid_data->getDataGridTable())
+                grid_data->getDataGridTable()->setStatement(nullptr);
             if (statementM != 0)
+            {
                 statementM->close();
+                statementM = nullptr;
+            }
             transactionM->rollback();
             log(wxString::Format(_("Transaction rolled back (elapsed time: %s)."),
                 millisToTimeString(sw.Time()).c_str()));
@@ -5054,6 +5078,8 @@ void ExecuteSqlFrame::setViewMode(bool splitView, ViewMode mode)
         styled_text_ctrl_stats->SetFocus();
     else if (mode == vmGrid)
     {
+        if (notebook_pane_2 && notebook_pane_2->GetSizer())
+            notebook_pane_2->Layout();
         grid_data->SetFocus();
         grid_data->AdjustScrollbars();
         grid_data->ForceRefresh();
